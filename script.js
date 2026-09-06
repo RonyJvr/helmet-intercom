@@ -38,8 +38,9 @@ let localStream = null;
 let roomCode = getRoomFromUrl();
 let userId = crypto.randomUUID();
 
-let peers = new Map();
-let remoteSources = new Map();
+const peers = new Map();
+const remoteSources = new Map();
+const pendingCandidates = new Map();
 
 let isMuted = false;
 let reconnectTimer = null;
@@ -88,6 +89,14 @@ function setConnectionStatus(connected, text) {
     }
 }
 
+async function resumeAudio() {
+    if (audioContext && audioContext.state !== "running") {
+        try {
+            await audioContext.resume();
+        } catch {}
+    }
+}
+
 async function setupAudio() {
     audioContext = new AudioContext();
 
@@ -110,21 +119,18 @@ async function setupAudio() {
         video: false
     });
 
-    if (isMuted) {
-        localStream.getAudioTracks().forEach(track => {
-            track.enabled = false;
-        });
-    }
+    await resumeAudio();
 }
 
 function createRemoteAudio(peerId, stream) {
-    if (!audioContext) return;
+    if (!audioContext || !remoteGainNode) return;
 
-    if (remoteSources.has(peerId)) {
+    const oldSource = remoteSources.get(peerId);
+
+    if (oldSource) {
         try {
-            remoteSources.get(peerId).disconnect();
+            oldSource.disconnect();
         } catch {}
-        remoteSources.delete(peerId);
     }
 
     const source = audioContext.createMediaStreamSource(stream);
@@ -132,15 +138,15 @@ function createRemoteAudio(peerId, stream) {
 
     remoteSources.set(peerId, source);
 
-    if (audioContext.state === "suspended") {
-        audioContext.resume();
-    }
+    resumeAudio();
 }
 
 function removePeer(peerId) {
     const peer = peers.get(peerId);
 
     if (peer) {
+        peer.ontrack = null;
+        peer.onicecandidate = null;
         peer.close();
         peers.delete(peerId);
     }
@@ -151,8 +157,11 @@ function removePeer(peerId) {
         try {
             source.disconnect();
         } catch {}
+
         remoteSources.delete(peerId);
     }
+
+    pendingCandidates.delete(peerId);
 
     updatePeopleCount();
 }
@@ -183,11 +192,12 @@ function createPeer(peerId, shouldOffer) {
     const peer = new RTCPeerConnection(ICE_SERVERS);
 
     peers.set(peerId, peer);
+    pendingCandidates.set(peerId, []);
 
     if (localStream) {
-        localStream.getTracks().forEach(track => {
+        for (const track of localStream.getTracks()) {
             peer.addTrack(track, localStream);
-        });
+        }
     }
 
     peer.ontrack = event => {
@@ -197,24 +207,34 @@ function createPeer(peerId, shouldOffer) {
     };
 
     peer.onicecandidate = event => {
-        if (event.candidate) {
-            send({
-                type: "ice-candidate",
-                sender: userId,
-                target: peerId,
-                candidate: event.candidate
-            });
-        }
+        if (!event.candidate) return;
+
+        send({
+            type: "ice-candidate",
+            sender: userId,
+            target: peerId,
+            candidate: event.candidate
+        });
     };
 
     peer.onconnectionstatechange = () => {
         const state = peer.connectionState;
 
-        if (state === "failed" || state === "closed") {
+        if (state === "failed") {
+            peer.restartIce();
+        }
+
+        if (state === "closed") {
             removePeer(peerId);
         }
 
         updatePeopleCount();
+    };
+
+    peer.oniceconnectionstatechange = () => {
+        if (peer.iceConnectionState === "failed") {
+            peer.restartIce();
+        }
     };
 
     if (shouldOffer) {
@@ -244,6 +264,20 @@ async function createOffer(peerId, peer) {
     } catch {}
 }
 
+async function flushCandidates(peerId, peer) {
+    const candidates = pendingCandidates.get(peerId) || [];
+
+    pendingCandidates.set(peerId, []);
+
+    for (const candidate of candidates) {
+        try {
+            await peer.addIceCandidate(
+                new RTCIceCandidate(candidate)
+            );
+        } catch {}
+    }
+}
+
 async function handleOffer(message) {
     const peer = createPeer(message.sender, false);
 
@@ -252,7 +286,10 @@ async function handleOffer(message) {
             new RTCSessionDescription(message.offer)
         );
 
+        await flushCandidates(message.sender, peer);
+
         const answer = await peer.createAnswer();
+
         await peer.setLocalDescription(answer);
 
         send({
@@ -273,13 +310,26 @@ async function handleAnswer(message) {
         await peer.setRemoteDescription(
             new RTCSessionDescription(message.answer)
         );
+
+        await flushCandidates(message.sender, peer);
     } catch {}
 }
 
 async function handleIceCandidate(message) {
+    if (!message.candidate || !message.sender) return;
+
     const peer = peers.get(message.sender);
 
-    if (!peer || !message.candidate) return;
+    if (!peer) return;
+
+    if (!peer.remoteDescription) {
+        const candidates = pendingCandidates.get(message.sender) || [];
+
+        candidates.push(message.candidate);
+        pendingCandidates.set(message.sender, candidates);
+
+        return;
+    }
 
     try {
         await peer.addIceCandidate(
@@ -290,6 +340,12 @@ async function handleIceCandidate(message) {
 
 function connectSignaling() {
     clearTimeout(reconnectTimer);
+
+    if (signalingSocket) {
+        try {
+            signalingSocket.close();
+        } catch {}
+    }
 
     signalingSocket = new WebSocket(SIGNALING_SERVER);
 
@@ -319,14 +375,17 @@ function connectSignaling() {
 
                     for (const id of message.users) {
                         if (id !== userId) {
-                            createPeer(id, true);
+                            createPeer(id, false);
                         }
                     }
                 }
                 break;
 
             case "user-joined":
-                if (message.userId && message.userId !== userId) {
+                if (
+                    message.userId &&
+                    message.userId !== userId
+                ) {
                     createPeer(message.userId, true);
                 }
                 break;
@@ -387,7 +446,7 @@ async function switchRoom(newRoom) {
         userId
     });
 
-    for (const peerId of peers.keys()) {
+    for (const peerId of [...peers.keys()]) {
         removePeer(peerId);
     }
 
@@ -439,7 +498,7 @@ amplificationSlider.addEventListener("input", () => {
 
     amplificationValue.textContent = `${value.toFixed(1)}×`;
 
-    if (remoteGainNode) {
+    if (remoteGainNode && audioContext) {
         remoteGainNode.gain.setTargetAtTime(
             value,
             audioContext.currentTime,
@@ -453,7 +512,7 @@ volumeSlider.addEventListener("input", () => {
 
     volumeValue.textContent = `${Math.round(value)}%`;
 
-    if (remoteVolumeNode) {
+    if (remoteVolumeNode && audioContext) {
         remoteVolumeNode.gain.setTargetAtTime(
             value / 100,
             audioContext.currentTime,
@@ -463,12 +522,13 @@ volumeSlider.addEventListener("input", () => {
 });
 
 muteButton.addEventListener("click", async () => {
-    if (audioContext && audioContext.state === "suspended") {
-        await audioContext.resume();
-    }
-
+    await resumeAudio();
     setMuted(!isMuted);
 });
+
+document.addEventListener("click", () => {
+    resumeAudio();
+}, { once: true });
 
 roomButton.addEventListener("click", () => {
     roomInput.value = roomCode;
