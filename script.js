@@ -40,6 +40,7 @@ let userId = crypto.randomUUID();
 
 const peers = new Map();
 const remoteSources = new Map();
+const remoteStreams = new Map();
 const pendingCandidates = new Map();
 
 let isMuted = false;
@@ -90,7 +91,9 @@ function setConnectionStatus(connected, text) {
 }
 
 async function resumeAudio() {
-    if (audioContext && audioContext.state !== "running") {
+    if (!audioContext) return;
+
+    if (audioContext.state !== "running") {
         try {
             await audioContext.resume();
         } catch {}
@@ -98,7 +101,7 @@ async function resumeAudio() {
 }
 
 async function setupAudio() {
-    audioContext = new AudioContext();
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
     remoteGainNode = audioContext.createGain();
     remoteVolumeNode = audioContext.createGain();
@@ -119,11 +122,13 @@ async function setupAudio() {
         video: false
     });
 
-    await resumeAudio();
+    setMuted(false);
 }
 
 function createRemoteAudio(peerId, stream) {
     if (!audioContext || !remoteGainNode) return;
+
+    remoteStreams.set(peerId, stream);
 
     const oldSource = remoteSources.get(peerId);
 
@@ -134,9 +139,22 @@ function createRemoteAudio(peerId, stream) {
     }
 
     const source = audioContext.createMediaStreamSource(stream);
+
     source.connect(remoteGainNode);
 
     remoteSources.set(peerId, source);
+
+    for (const track of stream.getAudioTracks()) {
+        track.onunmute = () => {
+            resumeAudio();
+        };
+
+        track.onmute = () => {};
+
+        track.onended = () => {
+            resumeAudio();
+        };
+    }
 
     resumeAudio();
 }
@@ -147,7 +165,13 @@ function removePeer(peerId) {
     if (peer) {
         peer.ontrack = null;
         peer.onicecandidate = null;
-        peer.close();
+        peer.onconnectionstatechange = null;
+        peer.oniceconnectionstatechange = null;
+
+        try {
+            peer.close();
+        } catch {}
+
         peers.delete(peerId);
     }
 
@@ -161,6 +185,7 @@ function removePeer(peerId) {
         remoteSources.delete(peerId);
     }
 
+    remoteStreams.delete(peerId);
     pendingCandidates.delete(peerId);
 
     updatePeopleCount();
@@ -201,9 +226,12 @@ function createPeer(peerId, shouldOffer) {
     }
 
     peer.ontrack = event => {
-        if (event.streams && event.streams[0]) {
-            createRemoteAudio(peerId, event.streams[0]);
-        }
+        const stream =
+            event.streams && event.streams[0]
+                ? event.streams[0]
+                : new MediaStream([event.track]);
+
+        createRemoteAudio(peerId, stream);
     };
 
     peer.onicecandidate = event => {
@@ -221,7 +249,9 @@ function createPeer(peerId, shouldOffer) {
         const state = peer.connectionState;
 
         if (state === "failed") {
-            peer.restartIce();
+            try {
+                peer.restartIce();
+            } catch {}
         }
 
         if (state === "closed") {
@@ -233,7 +263,9 @@ function createPeer(peerId, shouldOffer) {
 
     peer.oniceconnectionstatechange = () => {
         if (peer.iceConnectionState === "failed") {
-            peer.restartIce();
+            try {
+                peer.restartIce();
+            } catch {}
         }
     };
 
@@ -288,7 +320,10 @@ async function handleOffer(message) {
 
         await flushCandidates(message.sender, peer);
 
-        const answer = await peer.createAnswer();
+        const answer = await peer.createAnswer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: false
+        });
 
         await peer.setLocalDescription(answer);
 
@@ -323,7 +358,8 @@ async function handleIceCandidate(message) {
     if (!peer) return;
 
     if (!peer.remoteDescription) {
-        const candidates = pendingCandidates.get(message.sender) || [];
+        const candidates =
+            pendingCandidates.get(message.sender) || [];
 
         candidates.push(message.candidate);
         pendingCandidates.set(message.sender, candidates);
@@ -451,7 +487,9 @@ async function switchRoom(newRoom) {
     }
 
     if (signalingSocket) {
-        signalingSocket.close();
+        try {
+            signalingSocket.close();
+        } catch {}
     }
 
     roomCode = newRoom;
@@ -526,9 +564,13 @@ muteButton.addEventListener("click", async () => {
     setMuted(!isMuted);
 });
 
-document.addEventListener("click", () => {
-    resumeAudio();
-}, { once: true });
+document.addEventListener(
+    "click",
+    () => {
+        resumeAudio();
+    },
+    { once: true }
+);
 
 roomButton.addEventListener("click", () => {
     roomInput.value = roomCode;
@@ -563,7 +605,8 @@ newRoomButton.addEventListener("click", () => {
 });
 
 copyRoomButton.addEventListener("click", async () => {
-    const shareUrl = `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomCode)}`;
+    const shareUrl =
+        `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomCode)}`;
 
     try {
         await navigator.clipboard.writeText(shareUrl);
@@ -591,7 +634,9 @@ window.addEventListener("beforeunload", () => {
     });
 
     if (signalingSocket) {
-        signalingSocket.close();
+        try {
+            signalingSocket.close();
+        } catch {}
     }
 });
 
@@ -601,7 +646,6 @@ async function start() {
 
     try {
         await setupAudio();
-        setMuted(false);
         connectSignaling();
     } catch {
         setConnectionStatus(false, "Microphone unavailable");
