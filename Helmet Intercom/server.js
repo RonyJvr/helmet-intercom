@@ -1,7 +1,44 @@
+const http = require("http");
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const server = new WebSocket.Server({ port: PORT });
+
+const server = http.createServer((req, res) => {
+    let filePath = req.url === "/" ? "/index.html" : req.url;
+    filePath = path.join(__dirname, filePath);
+
+    const ext = path.extname(filePath);
+
+    const types = {
+        ".html": "text/html",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".json": "application/json",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon"
+    };
+
+    fs.readFile(filePath, (err, data) => {
+        if (err) {
+            res.writeHead(404, { "Content-Type": "text/plain" });
+            res.end("Not Found");
+            return;
+        }
+
+        res.writeHead(200, {
+            "Content-Type": types[ext] || "application/octet-stream"
+        });
+
+        res.end(data);
+    });
+});
+
+const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 
 function send(socket, data) {
@@ -35,7 +72,7 @@ function removeUser(socket) {
     }
 }
 
-server.on("connection", socket => {
+wss.on("connection", socket => {
     socket.room = null;
     socket.userId = null;
 
@@ -119,4 +156,6 @@ server.on("connection", socket => {
     socket.on("error", () => removeUser(socket));
 });
 
-console.log(`Earpiece server running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Helmet Intercom running on port ${PORT}`);
+});
